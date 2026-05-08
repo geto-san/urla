@@ -27,6 +27,12 @@ class FrameProcessingResult {
   /// Braking urgency from [BrakingHorizonEngine].
   final BrakingState? brakingState;
 
+  /// Original frame dimensions (pixels) that were fed into the ML model.
+  /// The overlay painter uses these to map model-space coordinates back to
+  /// the correct position on screen regardless of display resolution.
+  final int frameWidth;
+  final int frameHeight;
+
   /// True when the lane is virtual (synthesised, not detected).
   bool get isVirtualLane => lane?.type.name == 'virtual';
 
@@ -37,5 +43,7 @@ class FrameProcessingResult {
     this.traffic,
     this.overtakeDecision,
     this.brakingState,
+    this.frameWidth  = 640,
+    this.frameHeight = 640,
   });
 }

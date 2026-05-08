@@ -9,6 +9,7 @@ import 'package:urla/data/runtime/models/frame_processing_result.dart';
 import 'package:urla/data/runtime/models/geo_data.dart';
 import '../../data/runtime/models/lane_model.dart';
 import '../../data/domain/models/geo_model.dart';
+import '../../data/domain/models/road_model.dart';
 import '../../data/domain/repositories/lane_repository.dart';
 import '../../data/domain/repositories/road_repository.dart';
 import '../../data/domain/repositories/geo_repository.dart';
@@ -43,13 +44,13 @@ class FrameProcessor {
   final GeoService _geoService;
   final DynamicCalibration _calibration;
   final String _sessionId;
-  final ObstacleEngine _obstacleEngine;      
-  final OncomingTrafficEngine _trafficEngine; 
+  final ObstacleEngine _obstacleEngine;
+  final OncomingTrafficEngine _trafficEngine;
   final TemporalSteeringEngine _temporalSteering;
   final KalmanLaneTracker _kalmanTracker;
   final VirtualLaneGenerator _virtualLaneGenerator;
   final BrakingHorizonEngine _brakingEngine;
-  final RoadBehaviourEngine _roadBehaviourEngine;  
+  final RoadBehaviourEngine _roadBehaviourEngine;
 
   // Use a simple queue for pending detection frames
   final int _maxQueueSize = 2;
@@ -60,12 +61,19 @@ class FrameProcessor {
   GeoData? _cachedGeo;
   Timer? _geoTimer;
 
+  // Cached road model — refreshed every 10 s to avoid blocking the frame loop.
+  RoadModel? _cachedRoadModel;
+  Timer? _roadModelTimer;
+
   final StreamController<LaneModel> _laneStream = StreamController.broadcast();
   final StreamController<FrameProcessingResult> _resultStream =
       StreamController.broadcast();
+  final StreamController<GeoData> _geoStreamController =
+      StreamController<GeoData>.broadcast();
 
   Stream<LaneModel> get laneStream => _laneStream.stream;
   Stream<FrameProcessingResult> get resultStream => _resultStream.stream;
+  Stream<GeoData> get geoStream => _geoStreamController.stream;
 
   FrameProcessor(
     this._laneEngine,
@@ -76,9 +84,9 @@ class FrameProcessor {
     this._geoService,
     this._calibration,
     this._sessionId,
-    this._obstacleEngine,   
-    this._trafficEngine, 
-    this._temporalSteering,  
+    this._obstacleEngine,
+    this._trafficEngine,
+    this._temporalSteering,
     this._kalmanTracker,
     this._virtualLaneGenerator,
     this._brakingEngine,
@@ -106,8 +114,21 @@ class FrameProcessor {
     _geoTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
       try {
         _cachedGeo = await _geoService.getCurrentLocation();
+        _geoStreamController.add(_cachedGeo!);
       } catch (_) {
         // keep the last known value
+      }
+    });
+
+    // Refresh the road model from DB every 10 s — cheap enough to not block.
+    _roadModelTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      final geo = _cachedGeo;
+      if (geo == null) return;
+      try {
+        final id = '${geo.latitude.toStringAsFixed(4)}_${geo.longitude.toStringAsFixed(4)}';
+        _cachedRoadModel = await _roadRepository.getRoadStats(id);
+      } catch (e) {
+        debugPrint('Road model refresh failed: $e');
       }
     });
   }
@@ -134,6 +155,8 @@ class FrameProcessor {
 
   Future<void> _processDetections(_DetectionFrame frame) async {
     final detections = frame.detections;
+    final frameW = frame.width;
+    final frameH = frame.height;
     if (detections.isEmpty) return;
 
     // 1. Raw lane geometry from engine
@@ -146,7 +169,7 @@ class FrameProcessor {
     const trigger = VirtualLaneGenerator.triggerThreshold;
     if (smoothLane.confidence < trigger || smoothLane.centerLine.isEmpty) {
       // Attempt virtual generation
-      final historicalWidth = smoothLane.laneWidth;   // or fetch from DB?
+      final historicalWidth = smoothLane.laneWidth; // or fetch from DB?
       final virtual = _virtualLaneGenerator.generate(
         raw: smoothLane,
         detections: detections,
@@ -160,6 +183,8 @@ class FrameProcessor {
         debugPrint('No lane available (real or virtual)');
         final result = FrameProcessingResult(
           detections: detections,
+          frameWidth:  frameW,
+          frameHeight: frameH,
         );
         _resultStream.add(result);
         return;
@@ -173,7 +198,12 @@ class FrameProcessor {
     );
 
     if (_cachedGeo == null) {
-      final result = FrameProcessingResult(lane: smoothLane, detections: detections);
+      final result = FrameProcessingResult(
+        lane:        smoothLane,
+        detections:  detections,
+        frameWidth:  frameW,
+        frameHeight: frameH,
+      );
       _resultStream.add(result);
       return;
     }
@@ -181,7 +211,7 @@ class FrameProcessor {
 
     // 5. Obstacle & traffic
     final obstacle = _obstacleEngine.evaluate(detections, smoothLane);
-    final traffic   = _trafficEngine.evaluate(detections, smoothLane);
+    final traffic = _trafficEngine.evaluate(detections, smoothLane);
 
     // 6. Overtake (temporal)
     final overtake = _temporalSteering.evaluate(
@@ -198,12 +228,10 @@ class FrameProcessor {
       lane: smoothLane,
     );
 
-    // 8. Road behaviour (optional – comment out if not fully wired)
-    //    Fetch road model from DB and compute bias.
-    //    To avoid blocking, we can do it asynchronously and not include in this frame.
-    //    For now, we'll skip it or fire-and-forget a future update.
-    //    A simple approach: use a cached road model that's fetched periodically.
-    //    We'll leave it out for now.
+    // 8. Road behaviour — uses cached road model (refreshed every 10 s).
+    //    Applies historical bias to the overtake decision when enough data exists.
+    final roadBias = _roadBehaviourEngine.evaluate(_cachedRoadModel);
+    final effectiveOvertake = roadBias.hasOverride ? roadBias.overtakeOverride! : overtake;
 
     // 9. Geo grid, road segment, event logging (fire‑and‑forget) – use smoothLane
     final gridCoords = _geoRepository.toGridCoords(geo.latitude, geo.longitude);
@@ -214,12 +242,13 @@ class FrameProcessor {
       stability: smoothLane.confidence,
       sampleCount: 1,
     );
+    _fireAndForget(() => _geoRepository.updateCell(updatedCell), 'updateCell');
     _fireAndForget(
-      () => _geoRepository.updateCell(updatedCell),
-      'updateCell',
-    );
-    _fireAndForget(
-      () => _roadRepository.updateRoadFromLane(geo.latitude, geo.longitude, smoothLane),
+      () => _roadRepository.updateRoadFromLane(
+        geo.latitude,
+        geo.longitude,
+        smoothLane,
+      ),
       'updateRoadFromLane',
     );
     _fireAndForget(
@@ -236,12 +265,14 @@ class FrameProcessor {
 
     // 10. Build full result
     final result = FrameProcessingResult(
-      lane: smoothLane,
-      detections: detections,
-      obstacle: obstacle,
-      traffic: traffic,
-      overtakeDecision: overtake,
-      brakingState: braking,
+      lane:            smoothLane,
+      detections:      detections,
+      obstacle:        obstacle,
+      traffic:         traffic,
+      overtakeDecision: effectiveOvertake,
+      brakingState:    braking,
+      frameWidth:      frameW,
+      frameHeight:     frameH,
     );
     _resultStream.add(result);
   }
@@ -254,10 +285,12 @@ class FrameProcessor {
     );
   }
 
-  void dispose() {
+  Future<void> dispose() async{
     _geoTimer?.cancel();
+    _roadModelTimer?.cancel();
     _laneStream.close();
     _resultStream.close();
     _queue.clear();
+    await _geoStreamController.close();
   }
 }

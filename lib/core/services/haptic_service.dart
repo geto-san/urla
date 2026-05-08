@@ -24,7 +24,7 @@ class HapticService {
 
   Future<void> initialize() async {
     try {
-      _hasVibrator = await Vibration.hasVibrator() ?? false;
+      _hasVibrator = await Vibration.hasVibrator();
     } catch (e) {
       debugPrint('HapticService: vibration check failed – $e');
       _hasVibrator = false;

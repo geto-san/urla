@@ -1,59 +1,70 @@
-import 'dart:typed_data';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import '../../data/runtime/models/preprocess_task.dart';   // RawPreprocessTask
+import 'dart:async';
+import 'dart:isolate';
+import 'package:flutter/services.dart' show rootBundle;
+import '../../data/domain/models/frame_data.dart';
 import '../../data/runtime/models/detection_model.dart';
-import '../ml/yolo_decoder.dart';
-import 'preprocess_isolate.dart';
+import 'inference_isolate.dart';
 
 class TFLiteService {
-  late Interpreter _interpreter;
-  final PreprocessIsolate _preprocessIsolate = PreprocessIsolate();
+  Isolate?  _isolate;
+  SendPort? _isolateSendPort;
+  final ReceivePort _receivePort = ReceivePort();
+  bool _modelLoaded = false;
 
-  // Output buffer sizes (set after model load)
-  late int detectionOutputSize;
-  late int maskProtoSize;
+  int detectionOutputSize = 0;
+  int maskProtoSize       = 0;
 
   Future<void> loadModel() async {
-    await _preprocessIsolate.start();
+    final responses = _receivePort.asBroadcastStream();
 
-    _interpreter = await Interpreter.fromAsset(
-      'assets/models/yolov8_lane_seg.tflite',
-      options: InterpreterOptions()..threads = 4,
-    );
-    _interpreter.allocateTensors();
+    print('[TFLiteService] Spawning isolate...');
+    _isolate = await Isolate.spawn(inferenceIsolateEntry, _receivePort.sendPort);
+    print('[TFLiteService] Isolate spawned');
 
-    final detShape = _interpreter.getOutputTensor(0).shape;   // e.g., [1, N, 42]
-    final maskShape = _interpreter.getOutputTensor(1).shape; // e.g., [1, 32, 160, 160]
+    _isolateSendPort = await responses.first;
+    print('[TFLiteService] Received SendPort from isolate');
 
-    detectionOutputSize = detShape[1] * detShape[2];  // N * 42
-    maskProtoSize = maskShape[1] * maskShape[2] * maskShape[3]; // 32*160*160
+    final modelData  = await rootBundle.load('assets/models/yolov8_lane_seg.tflite');
+    final modelBytes = modelData.buffer.asUint8List();
+    print('[TFLiteService] Model bytes length: ${modelBytes.length}');
 
-    print('Detection output size: $detectionOutputSize floats');
-    print('Mask proto size: $maskProtoSize floats');
+    final loadReply = ReceivePort();
+    _isolateSendPort!.send([0, modelBytes, loadReply.sendPort]);   // tag 0 = load
+
+    final response = await loadReply.first;
+    loadReply.close();
+
+    if (response is Map) {
+      if (response.containsKey('error')) {
+        throw Exception('Model load failed: ${response['error']}');
+      }
+      detectionOutputSize = response['detSize'] as int;
+      maskProtoSize       = response['maskSize'] as int;
+      print('[TFLiteService] Model loaded. detSize=$detectionOutputSize maskSize=$maskProtoSize');
+    }
+    _modelLoaded = true;
   }
 
-  /// Run inference on a raw camera frame.
-  /// [task] contains YUV planes, width, height, and strides.
-  Future<List<DetectionModel>> predict(RawPreprocessTask task) async {
-    // Preprocessing (YUV→RGB, resize, normalise) runs in the background isolate
-    final Float32List tensor = await _preprocessIsolate.process(task);
+  Future<List<DetectionModel>> predict(FrameData frame) async {
+    if (!_modelLoaded || _isolateSendPort == null) {
+      throw StateError('Model not loaded');
+    }
 
-    // Prepare input and output tensors
-    final input = [tensor];
-    final detOutput = Float32List(detectionOutputSize);
-    final maskOutput = Float32List(maskProtoSize);
-    final outputMap = {0: detOutput, 1: maskOutput};
+    final replyPort = ReceivePort();
+    _isolateSendPort!.send([1, frame, replyPort.sendPort]);   // tag 1 = inference
 
-    // Run model
-    _interpreter.runForMultipleInputs(input, outputMap);
+    final result = await replyPort.first;
+    replyPort.close();
 
-    // Decode
-    final decoder = YoloSegDecoder();
-    return decoder.decode([detOutput, maskOutput], 0.4);
+    if (result is List<DetectionModel>) return result;
+    if (result is Map && result.containsKey('error')) {
+      throw Exception('Inference error: ${result['error']}');
+    }
+    throw Exception('Unexpected response: $result');
   }
 
   void dispose() {
-    _preprocessIsolate.dispose();
-    _interpreter.close();
+    _receivePort.close();
+    _isolate?.kill(priority: Isolate.immediate);
   }
 }
