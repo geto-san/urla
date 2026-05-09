@@ -86,34 +86,34 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 10),
 
-            // ── Test with image ───────────────────────────────────────────
-            // ElevatedButton.icon(
-            //   icon: const Icon(Icons.image),
-            //   label: const Text('Test with Image'),
-            //   style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)),
-            //   onPressed: () async {
+            //── Test with image ───────────────────────────────────────────
+            ElevatedButton.icon(
+              icon: const Icon(Icons.image),
+              label: const Text('Test with Image'),
+              style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)),
+              onPressed: () async {
 
-            //     print('[HomeScreen] Test with Image button pressed');
-            //     final services = await _servicesFuture;
-            //     print('[HomeScreen] Services ready');  
-            //     if (!mounted) return;
+                print('[HomeScreen] Test with Image button pressed');
+                final services = await _servicesFuture;
+                print('[HomeScreen] Services ready');  
+                if (!mounted) return;
 
-            //     // Stop live camera if running so TFLite interpreter is free.
-            //     if (_liveViewModel != null) {
-            //       await _liveViewModel!.stop();
-            //     }
+                // Stop live camera if running so TFLite interpreter is free.
+                if (_liveViewModel != null) {
+                  await _liveViewModel!.stop();
+                }
 
-            //      print('[HomeScreen] Navigating to ImageTestScreen');
-            //     Navigator.of(context).push(
-            //       MaterialPageRoute(
-            //         builder: (_) => ImageTestScreen(
-            //           tfliteService: services.tfliteService,
-            //           laneEngine:    services.laneEngine,
-            //         ),
-            //       ),
-            //     );
-            //   },
-            // ),
+                 print('[HomeScreen] Navigating to ImageTestScreen');
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => ImageTestScreen(
+                      tfliteService: services.tfliteService,
+                      laneEngine:    services.laneEngine,
+                    ),
+                  ),
+                );
+              },
+            ),
           
             // ElevatedButton.icon(
             //   icon: const Icon(Icons.bug_report),

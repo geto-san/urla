@@ -42,7 +42,7 @@ dependencies:
   image_picker: ^1.1.2
 
   #VIDEO PROCESSING (for VideoTestScreen frame extraction)
-  ffmpeg_kit_flutter_min: ^6.0.3
+  # ffmpeg_kit_flutter_min: ^6.0.3
 
   #ON-DEVICE ML INFERENCE
   tflite_flutter: ^0.12.1

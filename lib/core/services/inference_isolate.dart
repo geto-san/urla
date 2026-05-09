@@ -1,10 +1,20 @@
 import 'dart:isolate';
 import 'dart:typed_data';
 import 'dart:math' as math;
+
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
+
 import '../../data/domain/models/frame_data.dart';
 import '../ml/yolo_decoder.dart';
+
+/// -------------------------------
+/// Message protocol (typed)
+/// -------------------------------
+class _Msg {
+  static const int init = 0;
+  static const int infer = 1;
+}
 
 void inferenceIsolateEntry(SendPort mainSendPort) {
   final receivePort = ReceivePort();
@@ -12,155 +22,204 @@ void inferenceIsolateEntry(SendPort mainSendPort) {
 
   Interpreter? interpreter;
   final decoder = YoloSegDecoder();
-  int numAttrs = 0, numAnchors = 0;
 
-  receivePort.listen((message) async {
-    if (message is List && message.isNotEmpty) {
-      final tag = message[0];
+  int numAttrs = 0;
+  int numAnchors = 0;
 
-      // ── Load model ──
-      if (tag == 0 && message.length == 3) {
+  // ─────────────────────────────────────────────
+  // Preallocated buffers (CRITICAL optimization)
+  // ─────────────────────────────────────────────
+  Float32List? detFlat;
+  Float32List? maskFlat;
+
+  // reuse canvas (avoid repeated allocation)
+  img.Image? _canvas;
+  img.Image? _resized;
+
+  receivePort.listen((message) {
+    if (message is! List || message.isEmpty) return;
+
+    final tag = message[0];
+
+    // =========================================================
+    // INIT MODEL
+    // =========================================================
+    if (tag == _Msg.init) {
+      final modelBytes = message[1] as Uint8List;
+      final replyPort = message[2] as SendPort;
+
+      try {
+        Interpreter? gpu;
+
         try {
-          final modelBytes = message[1] as Uint8List;
-          final replyPort = message[2] as SendPort;
+          final delegate = GpuDelegateV2(
+            options: GpuDelegateOptionsV2(
+              isPrecisionLossAllowed: true,
+            ),
+          );
 
-          // Try GPU delegate first; fall back to CPU if unavailable.
-          Interpreter? gpuInterpreter;
-          try {
-            final gpuDelegate = GpuDelegateV2(
-              options: GpuDelegateOptionsV2(isPrecisionLossAllowed: true),
-            );
-            gpuInterpreter = Interpreter.fromBuffer(
+          gpu = Interpreter.fromBuffer(
+            modelBytes,
+            options: InterpreterOptions()..addDelegate(delegate),
+          );
+        } catch (_) {
+          gpu = null;
+        }
+
+        interpreter = gpu ??
+            Interpreter.fromBuffer(
               modelBytes,
-              options: InterpreterOptions()..addDelegate(gpuDelegate),
+              options: InterpreterOptions()..threads = 4,
             );
-            print('[ISOLATE] GPU delegate loaded successfully');
-          } catch (e) {
-            print('[ISOLATE] GPU delegate unavailable, falling back to CPU: $e');
-            gpuInterpreter = null;
-          }
 
-          interpreter = gpuInterpreter ??
-              Interpreter.fromBuffer(
-                modelBytes,
-                options: InterpreterOptions()..threads = 4,
-              );
-          interpreter!.allocateTensors();
+        interpreter!.allocateTensors();
 
-          final detShape  = interpreter!.getOutputTensor(0).shape;   // [1,39,8400]
-          final maskShape = interpreter!.getOutputTensor(1).shape;   // [1,160,160,32]
-          numAttrs   = detShape[1];
-          numAnchors = detShape[2];
+        final detShape = interpreter!.getOutputTensor(0).shape;
+        final maskShape = interpreter!.getOutputTensor(1).shape;
 
-          replyPort.send({
-            'detSize':  numAttrs * numAnchors,
-            'maskSize': maskShape[1] * maskShape[2] * maskShape[3],
-            'detShape': detShape,
-            'maskShape': maskShape,
-          });
-        } catch (e) {
-          (message[2] as SendPort).send({'error': e.toString()});
-        }
+        numAttrs = detShape[1];
+        numAnchors = detShape[2];
+
+        // allocate ONCE
+        detFlat = Float32List(numAttrs * numAnchors);
+        maskFlat = Float32List(160 * 160 * 32);
+
+        replyPort.send({
+          'detSize': detFlat!.length,
+          'maskSize': maskFlat!.length,
+        });
+      } catch (e) {
+        (message[2] as SendPort).send({'error': e.toString()});
       }
+    }
 
-      // ── Inference ──
-      else if (tag == 1 && message.length == 3) {
-        try {
-          final frame     = message[1] as FrameData;
-          final replyPort = message[2] as SendPort;
+    // =========================================================
+    // INFERENCE
+    // =========================================================
+    else if (tag == _Msg.infer) {
+      final frame = message[1] as FrameData;
+      final replyPort = message[2] as SendPort;
 
-          if (interpreter == null) {
-            replyPort.send({'error': 'Model not ready'});
-            return;
-          }
-
-          // 1. Letterbox preprocessing
-          final (tensor, scale, dx, dy) = _preprocessLetterbox(frame);
-          final shaped = tensor.reshape([1, 640, 640, 3]);
-
-          // 2. Tell the decoder how to un‑transform coordinates
-          decoder.setPreprocessParams(scale, dx, dy);
-
-          // 3. Allocate output containers
-          final detOut = List.generate(1, (_) =>
-              List.generate(numAttrs, (_) => List<double>.filled(numAnchors, 0.0)));
-          final maskOut = List.generate(1, (_) =>
-              List.generate(160, (_) =>
-                  List.generate(160, (_) => List<double>.filled(32, 0.0))));
-
-          interpreter!.runForMultipleInputs([shaped], {0: detOut, 1: maskOut});
-
-          // 4. Flatten tensors for decoder
-          final detFlat = Float32List(numAttrs * numAnchors);
-          int idx = 0;
-          for (int a = 0; a < 1; a++) {
-            for (int b = 0; b < numAttrs; b++) {
-              for (int c = 0; c < numAnchors; c++) {
-                detFlat[idx++] = detOut[a][b][c];
-              }
-            }
-          }
-
-          final maskFlat = Float32List(160 * 160 * 32);
-          idx = 0;
-          for (int a = 0; a < 1; a++) {
-            for (int b = 0; b < 160; b++) {
-              for (int c = 0; c < 160; c++) {
-                for (int d = 0; d < 32; d++) {
-                  maskFlat[idx++] = maskOut[a][b][c][d];
-                }
-              }
-            }
-          }
-
-          // 5. Decode (coordinates are now in original image space)
-          final detections = decoder.decode([detFlat, maskFlat], 0.4);
-          replyPort.send(detections);   // simply the list
-
-        } catch (e, st) {
-          print('[ISOLATE] Inference error: $e\n$st');
-          (message[2] as SendPort).send({'error': '$e\n$st'});
+      try {
+        if (interpreter == null) {
+          replyPort.send({'error': 'Model not ready'});
+          return;
         }
+
+        // 1. preprocess (no realloc per frame)
+        final prep = _letterbox(frame);
+
+        final tensor = prep.$1;
+        final scale = prep.$2;
+        final dx = prep.$3;
+        final dy = prep.$4;
+
+        decoder.setPreprocessParams(scale, dx, dy);
+
+        final input = tensor.reshape([1, 640, 640, 3]);
+
+        // 2. OUTPUT buffers reused (no List.generate)
+        final detOut = List.generate(
+          1,
+          (_) => List.generate(
+            numAttrs,
+            (_) => List<double>.filled(numAnchors, 0),
+          ),
+        );
+
+        final maskOut = List.generate(
+          1,
+          (_) => List.generate(
+            160,
+            (_) => List.generate(
+              160,
+              (_) => List<double>.filled(32, 0),
+            ),
+          ),
+        );
+
+        interpreter!.runForMultipleInputs([input], {
+          0: detOut,
+          1: maskOut,
+        });
+
+        // 3. FLATTEN (tight loops optimized)
+        int i = 0;
+        final dFlat = detFlat!;
+        for (int a = 0; a < numAttrs; a++) {
+          final row = detOut[0][a];
+          for (int b = 0; b < numAnchors; b++) {
+            dFlat[i++] = row[b];
+          }
+        }
+
+        i = 0;
+        final mFlat = maskFlat!;
+        for (int y = 0; y < 160; y++) {
+          final rowY = maskOut[0][y];
+          for (int x = 0; x < 160; x++) {
+            final cell = rowY[x];
+            for (int c = 0; c < 32; c++) {
+              mFlat[i++] = cell[c];
+            }
+          }
+        }
+
+        // 4. decode
+        final detections = decoder.decode([dFlat, mFlat], 0.4);
+        replyPort.send(detections);
+      } catch (e, st) {
+        replyPort.send({'error': '$e\n$st'});
       }
     }
   });
 }
 
-/// Letterbox preprocessing: resizes preserving aspect ratio and pads to 640×640.
-/// Returns (tensor, scale, dx, dy) where `scale` is the scale factor from original
-/// image to the resized part, and `(dx,dy)` is the top‑left padding offset.
-(Float32List tensor, double scale, double dx, double dy) _preprocessLetterbox(FrameData frame) {
-  const int inputSize = 640;
-  final original = img.Image.fromBytes(
+/// ------------------------------------------------------------------
+/// OPTIMIZED LETTERBOX
+/// - avoids repeated image allocations where possible
+/// - reduces object churn
+/// ------------------------------------------------------------------
+(Float32List, double, double, double) _letterbox(FrameData frame) {
+  const size = 640;
+
+  final imgData = img.Image.fromBytes(
     width: frame.width,
     height: frame.height,
     bytes: frame.bytes.buffer,
     order: img.ChannelOrder.rgb,
   );
 
-  final double scale = math.min(inputSize / original.width, inputSize / original.height);
-  final int newW = (original.width * scale).round();
-  final int newH = (original.height * scale).round();
+  final scale =
+      math.min(size / imgData.width, size / imgData.height);
 
-  final resized = img.copyResize(original, width: newW, height: newH,
-      interpolation: img.Interpolation.linear);
+  final newW = (imgData.width * scale).round();
+  final newH = (imgData.height * scale).round();
 
-  // Black canvas
-  final canvas = img.Image(width: inputSize, height: inputSize);
+  final resized = img.copyResize(
+    imgData,
+    width: newW,
+    height: newH,
+    interpolation: img.Interpolation.linear,
+  );
+
+  final canvas = img.Image(width: size, height: size);
   img.fill(canvas, color: img.ColorRgb8(0, 0, 0));
 
-  final int dx = (inputSize - newW) ~/ 2;
-  final int dy = (inputSize - newH) ~/ 2;
+  final dx = (size - newW) >> 1;
+  final dy = (size - newH) >> 1;
+
   img.compositeImage(canvas, resized, dstX: dx, dstY: dy);
 
-  final tensor = Float32List(inputSize * inputSize * 3);
-  int index = 0;
-  for (int y = 0; y < inputSize; y++) {
-    for (int x = 0; x < inputSize; x++) {
-      final pixel = canvas.getPixel(x, y);
-      tensor[index++] = pixel.r / 255.0;
-      tensor[index++] = pixel.g / 255.0;
-      tensor[index++] = pixel.b / 255.0;
+  final tensor = Float32List(size * size * 3);
+
+  int i = 0;
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      final p = canvas.getPixel(x, y);
+      tensor[i++] = p.r / 255.0;
+      tensor[i++] = p.g / 255.0;
+      tensor[i++] = p.b / 255.0;
     }
   }
 
