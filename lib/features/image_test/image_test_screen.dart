@@ -1,19 +1,20 @@
 import 'dart:async';
 import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
-import '../../data/domain/models/frame_data.dart';
-import '../../core/sources/image_frame_source.dart';
-import '../../core/services/tflite_service.dart';
+
 import '../../core/engine/lane_engine.dart';
-import '../../core/utils/camera_calibration.dart';
+import '../../core/services/tflite_service.dart';
+import '../../core/sources/image_frame_source.dart';
+import '../../data/domain/models/frame_data.dart';
 import '../../data/runtime/models/detection_model.dart';
-import '../../data/runtime/models/lane_model.dart';
 import '../../data/runtime/models/frame_processing_result.dart';
+import '../../data/runtime/models/lane_model.dart';
 import '../camera/view/lane_overly_painter.dart';
 
 class ImageTestScreen extends StatefulWidget {
   final TFLiteService tfliteService;
-  final LaneEngine laneEngine;
+  final LaneEngine    laneEngine;
 
   const ImageTestScreen({
     super.key,
@@ -26,7 +27,7 @@ class ImageTestScreen extends StatefulWidget {
 }
 
 class _ImageTestScreenState extends State<ImageTestScreen> {
-  final ImageFrameSource _source = ImageFrameSource();
+  final _source = ImageFrameSource();
   StreamSubscription<FrameData>? _subscription;
 
   Uint8List? _rawImageBytes;
@@ -35,9 +36,9 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
   Size? _imageNaturalSize;
 
   List<DetectionModel>? _detections;
-  LaneModel? _lane;
-  bool _processing = false;
-  String? _error;
+  LaneModel?            _lane;
+  bool                  _processing = false;
+  String?               _error;
 
   @override
   void initState() {
@@ -52,12 +53,13 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
     super.dispose();
   }
 
+  // ── Inference ─────────────────────────────────────────────────────────────
+
   Future<void> _onFrame(FrameData frame) async {
     if (_processing) return;
     _processing = true;
 
-    // Store the raw bytes for display AND remember the natural pixel dimensions.
-    // frame.width/height are the decoded image dimensions before any resize.
+    if (!mounted) return;
     setState(() {
       _rawImageBytes    = _source.lastRawBytes;
       _imageNaturalSize = Size(frame.width.toDouble(), frame.height.toDouble());
@@ -65,26 +67,27 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
     });
 
     try {
-      final detections = await widget.tfliteService.predict(frame);
+      final result = await widget.tfliteService.predict(frame);
 
-      // Use a local calibration for the image test — no live GPS available.
-      final calibration = DynamicCalibration(
-        focalX:       800,
-        focalY:       800,
-        principalX:   640,
-        principalY:   480,
-        cameraHeight: 1.2,
-      );
-      final lane = widget.laneEngine.buildLane(detections);
+      // predict() returns dropped:true only when TFLiteService is busy.
+      // In the image test we are the sole caller, so this should not happen —
+      // but guard it anyway to avoid a null-detections state.
+      if (result.dropped) {
+        if (!mounted) return;
+        setState(() => _processing = false);
+        return;
+      }
+
+      final lane = widget.laneEngine.buildLane(result.detections);
 
       if (!mounted) return;
       setState(() {
-        _detections = detections;
+        _detections = result.detections;
         _lane       = lane;
         _processing = false;
       });
-    } catch (e, stack) {
-      debugPrint('ImageTestScreen inference error: $e\n$stack');
+    } catch (e, st) {
+      debugPrint('ImageTestScreen inference error: $e\n$st');
       if (!mounted) return;
       setState(() {
         _processing = false;
@@ -95,6 +98,8 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
 
   void _pickImage() => _source.pickImage();
 
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -102,19 +107,19 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
       appBar: AppBar(title: const Text('Image Test')),
       body: Column(
         children: [
-          Expanded(
-            flex: 3,
-            child: _buildImageSection(),
-          ),
-          Expanded(
-            flex: 2,
-            child: _buildDebugInfo(),
-          ),
+          Expanded(flex: 3, child: _buildImageSection()),
+          Expanded(flex: 2, child: _buildDebugInfo()),
         ],
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _pickImage,
-        child: const Icon(Icons.image),
+        onPressed: _processing ? null : _pickImage,
+        child: _processing
+            ? const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+              )
+            : const Icon(Icons.image),
       ),
     );
   }
@@ -129,14 +134,7 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // Display the image with contain fitting (may have black bars)
-        Image.memory(
-          _rawImageBytes!,
-          fit: BoxFit.contain,
-        ),
-
-        // Overlay — pass the natural image size so the painter can compute
-        // the exact BoxFit.contain destination rect and align correctly.
+        Image.memory(_rawImageBytes!, fit: BoxFit.contain),
         if (_detections != null)
           CustomPaint(
             painter: LaneOverlayPainter(
@@ -144,9 +142,8 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
                 lane:       _lane,
                 detections: _detections!,
               ),
-              // ← Key fix: tells the painter the source image dimensions
-              // so it maps model coords to the letterboxed image area,
-              // not the full canvas.
+              // Tells the painter the source image dimensions so it maps model
+              // coords to the letterboxed image area, not the full canvas.
               sourceImageSize: _imageNaturalSize,
             ),
           ),
@@ -162,7 +159,10 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
       return Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(8),
-          child: Text(_error!, style: const TextStyle(color: Colors.red, fontSize: 11)),
+          child: Text(
+            _error!,
+            style: const TextStyle(color: Colors.red, fontSize: 11),
+          ),
         ),
       );
     }
@@ -172,40 +172,65 @@ class _ImageTestScreenState extends State<ImageTestScreen> {
       );
     }
 
-    // Group detections by class for easier reading
-    final byClass = <String, List<DetectionModel>>{};
-    for (final d in _detections!) {
-      byClass.putIfAbsent(d.className, () => []).add(d);
-    }
+    final byClass = _groupByClass(_detections!);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(8),
-      child: DefaultTextStyle(
-        style: const TextStyle(
-          color: Colors.greenAccent,
-          fontSize: 12,
-          fontFamily: 'monospace',
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Detections: ${_detections!.length}'),
-            ...byClass.entries.map((e) =>
-              Text('  ${e.key}: ${e.value.length} '
-                   '(best: ${(e.value.map((d) => d.confidence).reduce((a, b) => a > b ? a : b) * 100).toStringAsFixed(0)}%)')),
-            const SizedBox(height: 6),
-            if (_lane != null) ...[
-              Text('Lane type: ${_lane!.type.name}'),
-              Text('Lane width:   ${_lane!.laneWidth.toStringAsFixed(2)} m'),
-              Text('Curvature:    ${_lane!.curvature.toStringAsFixed(4)} m⁻¹'),
-              Text('Drift score:  ${_lane!.driftScore.toStringAsFixed(3)} m'),
-              Text('Confidence:   ${(_lane!.confidence * 100).toStringAsFixed(0)}%'),
-              Text('Center pts:   ${_lane!.centerLine.length}'),
-              Text('Left pts:     ${_lane!.leftBoundary.length}'),
-              Text('Right pts:    ${_lane!.rightBoundary.length}'),
-            ],
+      child: _DebugText(
+        children: [
+          'Detections: ${_detections!.length}',
+          ...byClass.entries.map((e) {
+            final best = _bestConf(e.value);
+            return '  ${e.key}: ${e.value.length}  '
+                '(best: ${(best * 100).toStringAsFixed(0)}%)';
+          }),
+          if (_lane != null) ...[
+            '',
+            'Lane type:    ${_lane!.type.name}',
+            'Lane width:   ${_lane!.laneWidth.toStringAsFixed(2)} m',
+            'Curvature:    ${_lane!.curvature.toStringAsFixed(4)} m⁻¹',
+            'Drift score:  ${_lane!.driftScore.toStringAsFixed(3)} m',
+            'Confidence:   ${(_lane!.confidence * 100).toStringAsFixed(0)}%',
+            'Center pts:   ${_lane!.centerLine.length}',
+            'Left pts:     ${_lane!.leftBoundary.length}',
+            'Right pts:    ${_lane!.rightBoundary.length}',
           ],
-        ),
+        ],
+      ),
+    );
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  Map<String, List<DetectionModel>> _groupByClass(List<DetectionModel> dets) {
+    final map = <String, List<DetectionModel>>{};
+    for (final d in dets) {
+      map.putIfAbsent(d.className, () => []).add(d);
+    }
+    return map;
+  }
+
+  double _bestConf(List<DetectionModel> list) =>
+      list.map((d) => d.confidence).reduce((a, b) => a > b ? a : b);
+}
+
+// ── Shared monospace debug widget ─────────────────────────────────────────
+
+class _DebugText extends StatelessWidget {
+  final List<String> children;
+  const _DebugText({required this.children});
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTextStyle(
+      style: const TextStyle(
+        color:      Colors.greenAccent,
+        fontSize:   12,
+        fontFamily: 'monospace',
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: children.map((s) => Text(s)).toList(),
       ),
     );
   }

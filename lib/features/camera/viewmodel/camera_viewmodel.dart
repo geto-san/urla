@@ -1,55 +1,61 @@
 import 'dart:async';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:urla/core/services/output_coordinator.dart';
-import 'package:urla/data/domain/models/frame_data.dart';
-import 'package:urla/data/runtime/models/frame_processing_result.dart';
-import 'package:urla/data/runtime/models/geo_data.dart';
+
 import '../../../core/services/frame_processor.dart';
+import '../../../core/services/output_coordinator.dart';
 import '../../../core/services/tflite_service.dart';
 import '../../../core/sources/camera_frame_source.dart';
+import '../../../data/domain/models/frame_data.dart';
+import '../../../data/runtime/models/frame_processing_result.dart';
+import '../../../data/runtime/models/geo_data.dart';
 
 // ---------------------------------------------------------------------------
 // CameraViewModel
 //
 // Lifecycle:
+//   1. Constructor — wires streams, no hardware touched.
+//   2. start()     — opens camera hardware (first call only), starts stream.
+//   3. stop()      — pauses stream, releases hardware lock.
+//   4. dispose()   — full teardown.
 //
-//   1. Constructor — wires streams, no hardware.
-//   2. initialize() — called by DashboardScreen.initState() via start().
-//        Opens camera hardware, sets up frame listener, starts inference.
-//   3. stop() — called when leaving Dashboard or entering image test.
-//        Stops image stream, releases hardware.
-//   4. start() — called when returning to Dashboard.
-//        Re-initializes if needed, restarts stream.
-//   5. dispose() — full teardown.
-//
-// The camera hardware is NEVER touched until start() is called.
+// The camera is NEVER touched until start() is called.
 // ---------------------------------------------------------------------------
 class CameraViewModel {
-  final CameraFrameSource _source;
-  final TFLiteService     _tflite;
-  final FrameProcessor    _processor;
-  final OutputCoordinator _outputCoordinator;
+  final CameraFrameSource  _source;
+  final TFLiteService      _tflite;
+  final FrameProcessor     _processor;
+  final OutputCoordinator  _outputCoordinator;
 
-  bool _inferring    = false;
-  bool _initialized  = false;
-  bool _running      = false;
+  bool _initialized = false;
+  bool _running     = false;
 
-  StreamSubscription<FrameData>?              _frameSubscription;
-  StreamSubscription<FrameProcessingResult>?  _resultSubscription;
-  StreamSubscription<GeoData>?                _geoSubscription;
+  // Back-pressure flag: only one inference in flight at a time.
+  // TFLiteService also enforces this internally, but we guard here so we
+  // never queue up awaiting predict() calls that pile on the isolate.
+  bool _inferring = false;
 
+  StreamSubscription<FrameData>?             _frameSubscription;
+  StreamSubscription<FrameProcessingResult>? _resultSubscription;
+  StreamSubscription<GeoData>?               _geoSubscription;
+
+  // ── Public state ──────────────────────────────────────────────────────────
+
+  /// Latest frame-processing result for the overlay painter.
   final ValueNotifier<FrameProcessingResult?> overlayData =
       ValueNotifier<FrameProcessingResult?>(null);
 
-  // Exposes the CameraController for CameraPreview widget.
-  // Null until initialize() completes.
+  /// Exposes the [CameraController] for the [CameraPreview] widget.
+  /// Null until [start] completes for the first time.
   ValueNotifier<CameraController?> get controllerNotifier =>
       _source.controllerNotifier;
 
   final ValueNotifier<bool>     showMap    = ValueNotifier(false);
   final ValueNotifier<GeoData?> currentGeo = ValueNotifier(null);
+
+  // ── Constructor ───────────────────────────────────────────────────────────
 
   CameraViewModel({
     required CameraFrameSource source,
@@ -57,49 +63,47 @@ class CameraViewModel {
     required FrameProcessor    processor,
     required OutputCoordinator outputCoordinator,
     required Stream<GeoData>   geoStream,
-  })  : _source            = source,
-        _tflite            = tflite,
-        _processor         = processor,
-        _outputCoordinator = outputCoordinator {
+  })  : _source             = source,
+        _tflite             = tflite,
+        _processor          = processor,
+        _outputCoordinator  = outputCoordinator {
     _geoSubscription = geoStream.listen((geo) => currentGeo.value = geo);
   }
 
-  // ── Called by DashboardScreen.initState() ─────────────────────────────────
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
   Future<void> start() async {
     if (_running) return;
 
     if (!_initialized) {
-      // Phase 2: open camera hardware (first time only).
+      // Open camera hardware exactly once.
       await _source.initialize();
       _initialized = true;
 
-      // Subscribe to pipeline results once.
+      // Subscribe to processor results once — persists across stop/start cycles.
       _resultSubscription = _processor.resultStream.listen((result) {
         overlayData.value = result;
-        // Fire-and-forget TTS + haptic — never blocks overlay update.
-        _outputCoordinator.process(result).catchError((e) {
+        // Fire-and-forget: TTS + haptic never block the overlay update.
+        _outputCoordinator.process(result).catchError((Object e) {
           debugPrint('OutputCoordinator error: $e');
         });
       });
     }
 
-    // Start camera stream + frame listener.
     await _source.start();
     _listenToFrames();
     _running = true;
   }
 
-  // ── Called when leaving Dashboard or entering image test ──────────────────
   Future<void> stop() async {
     if (!_running) return;
-    await _source.stop();
     await _frameSubscription?.cancel();
     _frameSubscription = null;
-    _running   = false;
-    _inferring = false;
+    await _source.stop();
+    _running    = false;
+    _inferring  = false;
   }
 
-  // ── Full disposal ─────────────────────────────────────────────────────────
   Future<void> dispose() async {
     await stop();
     await _resultSubscription?.cancel();
@@ -112,16 +116,26 @@ class CameraViewModel {
 
   void toggleMap() => showMap.value = !showMap.value;
 
-  // ── Internal frame pipeline ───────────────────────────────────────────────
+  // ── Frame pipeline ────────────────────────────────────────────────────────
+
   void _listenToFrames() {
     _frameSubscription = _source.frameStream.listen((frame) async {
-      // Drop frame if inference is still running (back-pressure).
+      // Drop frame if inference is still running — real-time stability.
       if (_inferring) return;
       _inferring = true;
 
       try {
-        final detections = await _tflite.predict(frame);
-        _processor.submitDetections(detections, frame.width, frame.height);
+        final result = await _tflite.predict(frame);
+
+        // result.dropped == true means TFLiteService was busy on its end too.
+        // Either way, skip submitting — nothing to decode.
+        if (result.dropped) return;
+
+        _processor.submitDetections(
+          result.detections,
+          frame.width,
+          frame.height,
+        );
       } catch (e, st) {
         debugPrint('Inference error: $e\n$st');
       } finally {

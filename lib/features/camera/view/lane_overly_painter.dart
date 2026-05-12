@@ -1,263 +1,338 @@
 import 'package:flutter/material.dart';
-import 'package:urla/data/domain/models/geometry/point.dart';
-import '../../../data/runtime/models/frame_processing_result.dart';
+
+import '../../../data/domain/models/geometry/point.dart';
 import '../../../data/runtime/models/detection_model.dart';
+import '../../../data/runtime/models/frame_processing_result.dart';
 
 // ---------------------------------------------------------------------------
 // LaneOverlayPainter
 //
-// Coordinate system contract
-// ──────────────────────────
-// All points in [FrameProcessingResult] (DetectionModel bbox/mask, LaneModel
-// polylines) are in **original-frame pixel space** — i.e. the pixel dimensions
-// of the camera frame or image that was fed into the ML model BEFORE any
-// letterbox resize.  The decoder already un-letterboxes model-space coords
-// back to this space.
+// Coordinate contract
+// ───────────────────
+// All points in [FrameProcessingResult] (bbox xMin/yMin/xMax/yMax, mask
+// polygon, LaneModel polylines) are in **original-frame pixel space** — the
+// pixel dimensions of the camera frame or image fed to the ML model BEFORE
+// any letterbox resize. The decoder unletterboxes model-space coords back to
+// this space before building DetectionModel.
 //
-// The painter's job is to map those coords onto the Flutter canvas, which may
-// be a different size and aspect ratio.  We do this with a single
-// [_computeImageRect] call that mirrors exactly how Flutter's Image widget
-// (or CameraPreview) places the content inside its box using BoxFit.contain.
+// The painter maps those coords onto the Flutter canvas, which may be a
+// different size and aspect ratio, using a single BoxFit.contain transform
+// that mirrors exactly how Flutter's Image widget (or CameraPreview) places
+// its content.
 //
-// Live camera path
-// ────────────────
-// [result.frameWidth] / [result.frameHeight] carry the camera frame size.
-// We compute a BoxFit.contain rect from those dimensions into the canvas and
-// map every point through it — same maths as the image test path.
+// Live camera:  result.frameWidth / frameHeight   → source size
+// Image / video test: [sourceImageSize] override  → source size (preferred)
 //
-// Image / video test path
-// ───────────────────────
-// [sourceImageSize] overrides the frame size (used when the caller knows the
-// display image size independently, e.g. ImageTestScreen).  If null, the
-// result's frameWidth/frameHeight are used.
+// Performance notes
+// ─────────────────
+// • TextPainter instances are cached across repaints keyed by (className, conf).
+//   TextPainter.layout() is expensive; this cuts it from O(n detections) per
+//   frame to O(new detections).
+// • Mask and lane paths are constructed once per paint call but kept as
+//   local Path objects (not stored) because the result reference changes
+//   every frame anyway.
+// • shouldRepaint checks by result identity (reference equality), which is
+//   correct because FrameProcessingResult is a new object every frame.
 // ---------------------------------------------------------------------------
+
 class LaneOverlayPainter extends CustomPainter {
   final FrameProcessingResult? result;
 
-  /// Override the source image size.  If null, result.frameWidth/frameHeight
-  /// are used.  Pass this from ImageTestScreen / VideoTestScreen where the
-  /// displayed image size is known independently.
+  /// Override source image dimensions. If null, result.frameWidth/Height used.
   final Size? sourceImageSize;
 
-  /// Show debug overlays (mask fills, image rect border).
+  /// When false, suppresses debug overlays (mask fill, image rect border).
+  /// Always false in production / live camera.
   final bool debugMode;
 
   LaneOverlayPainter(
     this.result, {
     this.sourceImageSize,
-    this.debugMode = true,
+    this.debugMode = false,
   });
+
+  // ── Label cache (persists across repaints while painter instance lives) ──
+  // Key: "$className $confPct" → laid-out TextPainter
+  final Map<String, TextPainter> _labelCache = {};
+
+  // ── Class colours ─────────────────────────────────────────────────────────
+  static const _classColors = <String, Color>{
+    'road_surface':        Color(0x9900C853),  // green 60 %
+    'road_edge':           Color(0xFFFFD600),  // amber 100 %
+    'center_line_marking': Color(0xFFFFFFFF),  // white 100 %
+    'road_obstruction':    Color(0xFFFF1744),  // red 100 %
+  };
+  static const _defaultColor = Color(0xFF2979FF); // blue
+
+  static Color _classColor(String name) =>
+      _classColors[name] ?? _defaultColor;
+
+  // ── Paints (const-like; constructed once) ─────────────────────────────────
+  static final _debugRectPaint = Paint()
+    ..color       = const Color(0x4D00E5FF) // cyan 30 %
+    ..style       = PaintingStyle.stroke
+    ..strokeWidth = 2.0;
+
+  static final _maskFillPaint = Paint()
+    ..color = const Color(0x4000E5FF) // cyan 25 %
+    ..style = PaintingStyle.fill;
+
+  static final _centerLinePaint = Paint()
+    ..color       = const Color(0xFF00E676) // green
+    ..strokeWidth = 3.0
+    ..style       = PaintingStyle.stroke
+    ..strokeCap   = StrokeCap.round
+    ..strokeJoin  = StrokeJoin.round;
+
+  static final _boundaryPaint = Paint()
+    ..color       = const Color(0xFFFFD600) // amber
+    ..strokeWidth = 2.0
+    ..style       = PaintingStyle.stroke
+    ..strokeCap   = StrokeCap.round
+    ..strokeJoin  = StrokeJoin.round;
 
   // ── Coordinate helpers ────────────────────────────────────────────────────
 
-  /// Compute the destination rect that BoxFit.contain places [imageSize]
-  /// inside [canvasSize] (centred, with black bars on the short axis).
-  Rect _computeImageRect(Size imageSize, Size canvasSize) {
-    final fitted = applyBoxFit(BoxFit.contain, imageSize, canvasSize);
-    final dest   = fitted.destination;
-    final dx     = (canvasSize.width  - dest.width)  / 2;
-    final dy     = (canvasSize.height - dest.height) / 2;
-    return Rect.fromLTWH(dx, dy, dest.width, dest.height);
-  }
-
-  /// Map a point from original-frame pixel space to canvas space.
-  Offset _toCanvas(Point p, Size canvasSize, Size srcSize, Rect imageRect) {
-    final rx = p.x / srcSize.width;
-    final ry = p.y / srcSize.height;
-    return Offset(
-      imageRect.left + rx * imageRect.width,
-      imageRect.top  + ry * imageRect.height,
+  /// Rect that BoxFit.contain places [src] inside [canvas] (centred).
+  static Rect _imageRect(Size src, Size canvas) {
+    final fitted = applyBoxFit(BoxFit.contain, src, canvas);
+    final dst    = fitted.destination;
+    return Rect.fromLTWH(
+      (canvas.width  - dst.width)  / 2,
+      (canvas.height - dst.height) / 2,
+      dst.width,
+      dst.height,
     );
   }
 
-  Offset _mapXY(double x, double y, Size canvasSize, Size srcSize, Rect imageRect) =>
-      _toCanvas(Point(x, y), canvasSize, srcSize, imageRect);
+  /// Map a single [Point] from original-frame space to canvas space.
+  static Offset _map(Point p, Size src, Rect ir) => Offset(
+        ir.left + (p.x / src.width)  * ir.width,
+        ir.top  + (p.y / src.height) * ir.height,
+      );
+
+  static Offset _mapXY(double x, double y, Size src, Rect ir) =>
+      _map(Point(x, y), src, ir);
+
+  // ── Path builders ─────────────────────────────────────────────────────────
+
+  static Path _polylinePath(List<Point> pts, Size src, Rect ir) {
+    final path  = Path();
+    final first = _map(pts[0], src, ir);
+    path.moveTo(first.dx, first.dy);
+    for (int i = 1; i < pts.length; i++) {
+      final o = _map(pts[i], src, ir);
+      path.lineTo(o.dx, o.dy);
+    }
+    return path;
+  }
+
+  static Path? _maskPath(List<Point> pts, Size src, Rect ir) {
+    if (pts.isEmpty) return null;
+    final path  = Path();
+    final first = _map(pts[0], src, ir);
+    path.moveTo(first.dx, first.dy);
+    for (int i = 1; i < pts.length; i++) {
+      final o = _map(pts[i], src, ir);
+      path.lineTo(o.dx, o.dy);
+    }
+    path.close();
+    return path;
+  }
 
   // ── Paint ─────────────────────────────────────────────────────────────────
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (result == null) return;
+    final r = result;
+    if (r == null) return;
 
-    final lane       = result!.lane;
-    final detections = result!.detections;
+    final detections = r.detections;
+    final lane       = r.lane;
 
-    // Resolve source image size: prefer explicit override, fall back to result.
-    final srcSize = sourceImageSize ??
-        Size(result!.frameWidth.toDouble(), result!.frameHeight.toDouble());
+    // Resolve source size
+    final src = sourceImageSize ??
+        (r.frameWidth > 0 && r.frameHeight > 0
+            ? Size(r.frameWidth.toDouble(), r.frameHeight.toDouble())
+            : null);
 
-    final imageRect = _computeImageRect(srcSize, size);
+    // If we have no size information at all we cannot map coordinates.
+    if (src == null || src.isEmpty) return;
 
-    // ── DEBUG: draw image destination rect ─────────────────────────────────
+    final ir = _imageRect(src, size);
+
+    // ── 1. DEBUG: image dest rect ────────────────────────────────────────
     if (debugMode) {
-      canvas.drawRect(
-        imageRect,
-        Paint()
-          ..color       = Colors.cyan.withValues(alpha: 0.3)
-          ..style       = PaintingStyle.stroke
-          ..strokeWidth = 3.0,
-      );
+      canvas.drawRect(ir, _debugRectPaint);
     }
 
-    // ── DEBUG: fill detection masks ───────────────────────────────────────
+    // ── 2. Mask fills (debug only — polygon masks are drawn as stroked
+    //       outlines in production to avoid covering road content) ────────
     if (debugMode) {
       for (final det in detections) {
-        if (det.mask.isNotEmpty) {
-          final path  = Path();
-          final first = _toCanvas(det.mask[0], size, srcSize, imageRect);
-          path.moveTo(first.dx, first.dy);
-          for (int i = 1; i < det.mask.length; i++) {
-            final p = _toCanvas(det.mask[i], size, srcSize, imageRect);
-            path.lineTo(p.dx, p.dy);
-          }
-          path.close();
+        final path = _maskPath(det.mask, src, ir);
+        if (path != null) canvas.drawPath(path, _maskFillPaint);
+      }
+    }
+
+    // ── 3. Mask outlines (always — shows segmentation boundary) ──────────
+    for (final det in detections) {
+      if (det.mask.length >= 3) {
+        final path = _maskPath(det.mask, src, ir);
+        if (path != null) {
           canvas.drawPath(
             path,
             Paint()
-              ..color = Colors.cyan.withValues(alpha: 0.25)
-              ..style = PaintingStyle.fill,
+              ..color       = _classColor(det.className).withValues(alpha: 0.75)
+              ..style       = PaintingStyle.stroke
+              ..strokeWidth = 1.5,
           );
         }
       }
     }
 
-    // ── Lane lines ────────────────────────────────────────────────────────
+    // ── 4. Lane lines ─────────────────────────────────────────────────────
     if (lane != null) {
       if (lane.centerLine.length >= 2) {
-        _drawPolyline(canvas, size, srcSize, imageRect,
-            lane.centerLine, Colors.green, 3.0);
+        canvas.drawPath(_polylinePath(lane.centerLine, src, ir), _centerLinePaint);
       }
       if (lane.leftBoundary.length >= 2) {
-        _drawPolyline(canvas, size, srcSize, imageRect,
-            lane.leftBoundary, Colors.yellow, 2.0);
+        canvas.drawPath(_polylinePath(lane.leftBoundary, src, ir), _boundaryPaint);
       }
       if (lane.rightBoundary.length >= 2) {
-        _drawPolyline(canvas, size, srcSize, imageRect,
-            lane.rightBoundary, Colors.yellow, 2.0);
+        canvas.drawPath(_polylinePath(lane.rightBoundary, src, ir), _boundaryPaint);
       }
     }
 
-    // ── Detection boxes ───────────────────────────────────────────────────
+    // ── 5. Detection bounding boxes + labels ──────────────────────────────
     for (final det in detections) {
-      _drawDetectionBox(canvas, size, srcSize, imageRect, det);
+      _drawBox(canvas, size, src, ir, det);
     }
 
-    // ── Warnings ──────────────────────────────────────────────────────────
+    // ── 6. Warning banners (stacked, non-overlapping) ─────────────────────
+    double warningY = 0;
     if (lane != null && lane.confidence < 0.35) {
-      _drawWarning(canvas, size, 'Low Lane Confidence');
+      warningY = _drawWarning(canvas, size, 'Low lane confidence',
+          color: const Color(0xFFFF6D00), y: warningY);
     }
-    if (result!.overtakeDecision != null) {
-      final od = result!.overtakeDecision!;
+
+    final od = r.overtakeDecision;
+    if (od != null) {
       if (od.name == 'notAllowed') {
-        _drawWarning(canvas, size, 'Do Not Overtake', color: Colors.red);
+        warningY = _drawWarning(canvas, size, 'Do not overtake',
+            color: const Color(0xFFD50000), y: warningY);
       } else if (od.name == 'caution') {
-        _drawWarning(canvas, size, 'Overtake with Caution',
-            color: Colors.orange, yOffset: 40);
+        _drawWarning(canvas, size, 'Overtake with caution',
+            color: const Color(0xFFFF6D00), y: warningY);
       }
     }
   }
 
-  // ── Drawing helpers ───────────────────────────────────────────────────────
+  // ── Box + label ───────────────────────────────────────────────────────────
 
-  void _drawPolyline(
+  void _drawBox(
     Canvas canvas,
     Size canvasSize,
-    Size srcSize,
-    Rect imageRect,
-    List<Point> points,
-    Color color,
-    double strokeWidth,
-  ) {
-    if (points.length < 2) return;
-    final paint = Paint()
-      ..color       = color
-      ..strokeWidth = strokeWidth
-      ..style       = PaintingStyle.stroke
-      ..strokeCap   = StrokeCap.round
-      ..strokeJoin  = StrokeJoin.round;
-
-    final path  = Path();
-    final first = _toCanvas(points[0], canvasSize, srcSize, imageRect);
-    path.moveTo(first.dx, first.dy);
-    for (int i = 1; i < points.length; i++) {
-      final p = _toCanvas(points[i], canvasSize, srcSize, imageRect);
-      path.lineTo(p.dx, p.dy);
-    }
-    canvas.drawPath(path, paint);
-  }
-
-  void _drawDetectionBox(
-    Canvas canvas,
-    Size canvasSize,
-    Size srcSize,
-    Rect imageRect,
+    Size src,
+    Rect ir,
     DetectionModel det,
   ) {
-    final tl   = _mapXY(det.xMin, det.yMin, canvasSize, srcSize, imageRect);
-    final br   = _mapXY(det.xMax, det.yMax, canvasSize, srcSize, imageRect);
+    final tl   = _mapXY(det.xMin, det.yMin, src, ir);
+    final br   = _mapXY(det.xMax, det.yMax, src, ir);
     final rect = Rect.fromLTRB(tl.dx, tl.dy, br.dx, br.dy);
+
+    // Skip degenerate boxes (can happen on edge detections)
+    if (rect.width < 1 || rect.height < 1) return;
 
     canvas.drawRect(
       rect,
       Paint()
         ..color       = _classColor(det.className)
-        ..strokeWidth = 2
+        ..strokeWidth = 1.5
         ..style       = PaintingStyle.stroke,
     );
 
-    final labelY = (tl.dy - 16).clamp(0.0, canvasSize.height - 18);
-    (TextPainter(
-      text: TextSpan(
-        text: '${det.className} ${(det.confidence * 100).toStringAsFixed(0)}%',
-        style: const TextStyle(
-          color:      Colors.white,
-          fontSize:   11,
-          fontWeight: FontWeight.bold,
-          shadows:    [Shadow(color: Colors.black, blurRadius: 2)],
+    _drawLabel(canvas, canvasSize, det, tl);
+  }
+
+  void _drawLabel(
+    Canvas canvas,
+    Size canvasSize,
+    DetectionModel det,
+    Offset tl,
+  ) {
+    final confPct = (det.confidence * 100).toStringAsFixed(0);
+    final key     = '${det.className} $confPct%';
+
+    // Use cached painter; create + layout only on first encounter.
+    final tp = _labelCache.putIfAbsent(key, () {
+      final p = TextPainter(
+        text: TextSpan(
+          text:  key,
+          style: const TextStyle(
+            color:      Colors.white,
+            fontSize:   11,
+            fontWeight: FontWeight.w600,
+            shadows:    [Shadow(color: Colors.black, blurRadius: 2)],
+          ),
         ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout())
-        .paint(canvas, Offset(tl.dx, labelY));
+        textDirection: TextDirection.ltr,
+      )..layout();
+      return p;
+    });
+
+    // Clamp label above box but within canvas
+    final labelY = (tl.dy - tp.height - 2).clamp(0.0, canvasSize.height - tp.height);
+    final labelX = tl.dx.clamp(0.0, canvasSize.width  - tp.width);
+
+    // Pill background for readability
+    final bgRect = Rect.fromLTWH(labelX - 2, labelY - 1, tp.width + 4, tp.height + 2);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(bgRect, const Radius.circular(3)),
+      Paint()..color = _classColor(det.className).withValues(alpha: 0.7),
+    );
+
+    tp.paint(canvas, Offset(labelX, labelY));
   }
 
-  Color _classColor(String className) {
-    switch (className) {
-      case 'road_surface':        return Colors.green.withValues(alpha: 0.6);
-      case 'road_edge':           return Colors.yellow.withValues(alpha: 1.0);
-      case 'center_line_marking': return Colors.white.withValues(alpha: 1.0);
-      case 'road_obstruction':    return Colors.red.withValues(alpha: 1.0);
-      default:                    return Colors.blue.withValues(alpha: 1.0);
-    }
-  }
+  // ── Warning banner ────────────────────────────────────────────────────────
 
-  void _drawWarning(
+  /// Draws a full-width banner at [y] and returns the y of the next banner.
+  double _drawWarning(
     Canvas canvas,
     Size size,
     String message, {
-    Color color    = Colors.red,
-    double yOffset = 0,
+    required Color color,
+    required double y,
   }) {
+    const h = 34.0;
     canvas.drawRect(
-      Rect.fromLTWH(0, yOffset, size.width, 36),
-      Paint()..color = color.withValues(alpha: 0.55),
+      Rect.fromLTWH(0, y, size.width, h),
+      Paint()..color = color.withValues(alpha: 0.72),
     );
-    (TextPainter(
+
+    final tp = TextPainter(
       text: TextSpan(
         text:  message,
         style: const TextStyle(
           color:      Colors.white,
-          fontSize:   16,
-          fontWeight: FontWeight.bold,
+          fontSize:   15,
+          fontWeight: FontWeight.w700,
           shadows:    [Shadow(color: Colors.black, blurRadius: 3)],
         ),
       ),
       textDirection: TextDirection.ltr,
-    )..layout())
-        .paint(canvas, Offset(10, yOffset + 8));
+    )..layout();
+
+    tp.paint(canvas, Offset(12, y + (h - tp.height) / 2));
+    return y + h;
   }
+
+  // ── Repaint guard ─────────────────────────────────────────────────────────
 
   @override
   bool shouldRepaint(LaneOverlayPainter old) =>
-      old.result != result || old.sourceImageSize != sourceImageSize;
+      !identical(old.result, result) ||
+      old.sourceImageSize != sourceImageSize ||
+      old.debugMode != debugMode;
 }

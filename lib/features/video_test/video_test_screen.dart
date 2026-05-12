@@ -11,7 +11,6 @@
 
 // import '../../core/engine/lane_engine.dart';
 // import '../../core/services/tflite_service.dart';
-// import '../../core/utils/camera_calibration.dart';
 // import '../../data/domain/models/frame_data.dart';
 // import '../../data/runtime/models/detection_model.dart';
 // import '../../data/runtime/models/frame_processing_result.dart';
@@ -20,12 +19,9 @@
 // // ---------------------------------------------------------------------------
 // // VideoTestScreen
 // //
-// // Picks a video from the gallery, extracts frames at [_targetFps] using
-// // ffmpeg, then runs each frame through TFLite + LaneEngine and renders the
-// // overlay — exactly like the live camera but on pre-recorded footage.
-// //
-// // Use this to debug overlay alignment and model quality on moving frames
-// // before switching to the real-time camera feed.
+// // Picks a video, extracts frames at [_targetFps] via ffmpeg, then runs each
+// // frame through TFLite + LaneEngine and renders the overlay — exactly like
+// // the live camera but on pre-recorded footage.
 // // ---------------------------------------------------------------------------
 // class VideoTestScreen extends StatefulWidget {
 //   final TFLiteService tfliteService;
@@ -44,41 +40,27 @@
 // class _VideoTestScreenState extends State<VideoTestScreen> {
 //   // ── State ─────────────────────────────────────────────────────────────────
 
-//   /// Extracted JPEG frame files, in order.
-//   List<File> _frames = [];
+//   List<File> _frames       = [];
+//   int        _currentIndex = 0;
 
-//   /// Index of the frame currently displayed.
-//   int _currentIndex = 0;
-
-//   /// Raw JPEG bytes of the displayed frame (for Image.memory).
-//   Uint8List? _displayBytes;
-
-//   /// Natural pixel size of the displayed frame.
-//   Size? _frameSize;
-
-//   /// Latest inference result for the displayed frame.
+//   Uint8List?             _displayBytes;
+//   Size?                  _frameSize;
 //   FrameProcessingResult? _result;
 
-//   /// True while ffmpeg is extracting frames.
-//   bool _extracting = false;
-
-//   /// True while TFLite is running on the current frame.
-//   bool _inferring = false;
-
-//   /// Playback timer — null when paused.
-//   Timer? _playTimer;
+//   bool    _extracting = false;
+//   bool    _inferring  = false;
+//   Timer?  _playTimer;
 
 //   bool get _isPlaying => _playTimer != null;
 
-//   /// Frames per second for extraction and playback.
 //   static const int _targetFps = 5;
 
 //   String? _statusMessage;
 //   String? _error;
 
-//   // ── Temp directory ────────────────────────────────────────────────────────
-
 //   Directory? _framesDir;
+
+//   // ── Init / dispose ────────────────────────────────────────────────────────
 
 //   @override
 //   void initState() {
@@ -87,7 +69,7 @@
 //   }
 
 //   Future<void> _initFramesDir() async {
-//     final tmp = await getTemporaryDirectory();
+//     final tmp  = await getTemporaryDirectory();
 //     _framesDir = Directory('${tmp.path}/urla_video_frames');
 //     if (_framesDir!.existsSync()) _framesDir!.deleteSync(recursive: true);
 //     _framesDir!.createSync();
@@ -106,6 +88,9 @@
 //     final XFile? file = await picker.pickVideo(source: ImageSource.gallery);
 //     if (file == null) return;
 
+//     // Stop playback before clearing state.
+//     if (_isPlaying) _stopPlayback();
+
 //     setState(() {
 //       _extracting    = true;
 //       _frames        = [];
@@ -116,15 +101,12 @@
 //       _error         = null;
 //     });
 
-//     // Clear old frames
 //     if (_framesDir != null && _framesDir!.existsSync()) {
 //       _framesDir!.deleteSync(recursive: true);
 //       _framesDir!.createSync();
 //     }
 
 //     final outPattern = '${_framesDir!.path}/frame_%04d.jpg';
-
-//     // ffmpeg: extract at target FPS, scale to 720p max width, high quality JPEG
 //     final cmd =
 //         '-i "${file.path}" -vf "fps=$_targetFps,scale=\'min(720,iw)\':-2" '
 //         '-q:v 2 "$outPattern"';
@@ -133,8 +115,8 @@
 //     final rc      = await session.getReturnCode();
 
 //     if (!ReturnCode.isSuccess(rc)) {
-//       final logs = await session.getLogsAsString();
 //       if (!mounted) return;
+//       final logs = await session.getLogsAsString();
 //       setState(() {
 //         _extracting    = false;
 //         _error         = 'ffmpeg failed:\n$logs';
@@ -143,7 +125,6 @@
 //       return;
 //     }
 
-//     // Collect extracted frames sorted by name
 //     final files = _framesDir!
 //         .listSync()
 //         .whereType<File>()
@@ -165,29 +146,37 @@
 
 //   Future<void> _showFrame(int index) async {
 //     if (index < 0 || index >= _frames.length) return;
-//     _currentIndex = index;
+
+//     // Guard: don't stack inference calls during rapid scrubbing / playback.
+//     // We update the index immediately so the scrubber feels responsive, then
+//     // run inference for the frame that was current when inference finishes.
+//     if (!mounted) return;
+//     setState(() {
+//       _currentIndex = index;
+//       _result       = null; // clear stale result while inferring
+//     });
 
 //     final bytes   = await _frames[index].readAsBytes();
 //     final decoded = img.decodeJpg(bytes);
-//     if (decoded == null) return;
+//     if (decoded == null || !mounted) return;
 
-//     if (!mounted) return;
 //     setState(() {
 //       _displayBytes = bytes;
 //       _frameSize    = Size(decoded.width.toDouble(), decoded.height.toDouble());
-//       _result       = null;   // clear stale result while inferring
 //     });
 
 //     await _runInference(decoded);
 //   }
 
 //   Future<void> _runInference(img.Image decoded) async {
+//     // Skip if another inference is already in flight (e.g. fast scrubbing).
 //     if (_inferring) return;
 //     _inferring = true;
 
 //     try {
 //       final rgbBytes = Uint8List.fromList(
-//           decoded.getBytes(order: img.ChannelOrder.rgb));
+//         decoded.getBytes(order: img.ChannelOrder.rgb),
+//       );
 
 //       final frame = FrameData(
 //         bytes:  rgbBytes,
@@ -195,23 +184,19 @@
 //         height: decoded.height,
 //       );
 
-//       final detections = await widget.tfliteService.predict(frame);
+//       final result = await widget.tfliteService.predict(frame);
 
-//       // Local calibration — no live GPS in test mode.
-//       final calibration = DynamicCalibration(
-//         focalX:       800,
-//         focalY:       800,
-//         principalX:   640,
-//         principalY:   480,
-//         cameraHeight: 1.2,
-//       );
-//       final lane = widget.laneEngine.buildLane(detections);
+//       // dropped:true means the service was busy — skip this frame silently.
+//       // This can happen during fast playback; the next frame will succeed.
+//       if (result.dropped || !mounted) return;
+
+//       final lane = widget.laneEngine.buildLane(result.detections);
 
 //       if (!mounted) return;
 //       setState(() {
 //         _result = FrameProcessingResult(
 //           lane:        lane,
-//           detections:  detections,
+//           detections:  result.detections,
 //           frameWidth:  decoded.width,
 //           frameHeight: decoded.height,
 //         );
@@ -229,26 +214,38 @@
 
 //   void _togglePlay() {
 //     if (_isPlaying) {
-//       _playTimer?.cancel();
-//       _playTimer = null;
-//       setState(() {});
+//       _stopPlayback();
 //     } else {
-//       _playTimer = Timer.periodic(
-//         Duration(milliseconds: (1000 / _targetFps).round()),
-//         (_) async {
-//           if (_currentIndex + 1 >= _frames.length) {
-//             _togglePlay(); // stop at end
-//             return;
-//           }
-//           await _showFrame(_currentIndex + 1);
-//         },
-//       );
-//       setState(() {});
+//       _startPlayback();
 //     }
+//     setState(() {});
+//   }
+
+//   void _startPlayback() {
+//     _playTimer = Timer.periodic(
+//       Duration(milliseconds: (1000 / _targetFps).round()),
+//       (_) async {
+//         final next = _currentIndex + 1;
+//         if (next >= _frames.length) {
+//           _stopPlayback();
+//           if (mounted) setState(() {});
+//           return;
+//         }
+//         await _showFrame(next);
+//       },
+//     );
+//   }
+
+//   void _stopPlayback() {
+//     _playTimer?.cancel();
+//     _playTimer = null;
 //   }
 
 //   void _stepFrame(int delta) {
-//     if (_isPlaying) _togglePlay();
+//     if (_isPlaying) {
+//       _stopPlayback();
+//       setState(() {});
+//     }
 //     _showFrame((_currentIndex + delta).clamp(0, _frames.length - 1));
 //   }
 
@@ -262,7 +259,7 @@
 //         title: const Text('Video Test'),
 //         actions: [
 //           IconButton(
-//             icon: const Icon(Icons.video_library),
+//             icon:    const Icon(Icons.video_library),
 //             tooltip: 'Pick video',
 //             onPressed: _extracting ? null : _pickAndExtract,
 //           ),
@@ -270,18 +267,9 @@
 //       ),
 //       body: Column(
 //         children: [
-//           // ── Frame viewer ────────────────────────────────────────────────
-//           Expanded(
-//             flex: 3,
-//             child: _buildFrameSection(),
-//           ),
-//           // ── Controls ────────────────────────────────────────────────────
+//           Expanded(flex: 3, child: _buildFrameSection()),
 //           _buildControls(),
-//           // ── Debug info ──────────────────────────────────────────────────
-//           Expanded(
-//             flex: 2,
-//             child: _buildDebugInfo(),
-//           ),
+//           Expanded(flex: 2, child: _buildDebugInfo()),
 //         ],
 //       ),
 //     );
@@ -295,8 +283,10 @@
 //           children: [
 //             const CircularProgressIndicator(),
 //             const SizedBox(height: 12),
-//             Text(_statusMessage ?? '',
-//                 style: const TextStyle(color: Colors.white70)),
+//             Text(
+//               _statusMessage ?? '',
+//               style: const TextStyle(color: Colors.white70),
+//             ),
 //           ],
 //         ),
 //       );
@@ -309,12 +299,16 @@
 //           children: [
 //             const Icon(Icons.video_library, size: 64, color: Colors.white24),
 //             const SizedBox(height: 12),
-//             const Text('Pick a video to begin',
-//                 style: TextStyle(color: Colors.white54)),
+//             const Text(
+//               'Pick a video to begin',
+//               style: TextStyle(color: Colors.white54),
+//             ),
 //             if (_error != null) ...[
 //               const SizedBox(height: 8),
-//               Text(_error!,
-//                   style: const TextStyle(color: Colors.red, fontSize: 11)),
+//               Text(
+//                 _error!,
+//                 style: const TextStyle(color: Colors.red, fontSize: 11),
+//               ),
 //             ],
 //           ],
 //         ),
@@ -330,9 +324,10 @@
 //             painter: LaneOverlayPainter(
 //               _result,
 //               sourceImageSize: _frameSize,
-//               debugMode: true,
+//               debugMode:       true,
 //             ),
 //           ),
+//         // Spinner in corner while inferring (non-blocking)
 //         if (_inferring)
 //           const Positioned(
 //             top: 8, right: 8,
@@ -354,15 +349,17 @@
 //       child: Column(
 //         mainAxisSize: MainAxisSize.min,
 //         children: [
-//           // Scrubber
 //           Slider(
-//             value: _currentIndex.toDouble(),
-//             min:   0,
-//             max:   (_frames.length - 1).toDouble(),
+//             value:     _currentIndex.toDouble(),
+//             min:       0,
+//             max:       (_frames.length - 1).toDouble(),
 //             divisions: _frames.length - 1,
-//             label: 'Frame $_currentIndex',
+//             label:     'Frame $_currentIndex',
 //             onChanged: (v) {
-//               if (_isPlaying) _togglePlay();
+//               if (_isPlaying) {
+//                 _stopPlayback();
+//                 setState(() {});
+//               }
 //               _showFrame(v.round());
 //             },
 //           ),
@@ -370,7 +367,7 @@
 //             mainAxisAlignment: MainAxisAlignment.center,
 //             children: [
 //               IconButton(
-//                 icon: const Icon(Icons.skip_previous, color: Colors.white),
+//                 icon:    const Icon(Icons.skip_previous, color: Colors.white),
 //                 onPressed: () => _stepFrame(-1),
 //               ),
 //               IconButton(
@@ -382,7 +379,7 @@
 //                 onPressed: _togglePlay,
 //               ),
 //               IconButton(
-//                 icon: const Icon(Icons.skip_next, color: Colors.white),
+//                 icon:    const Icon(Icons.skip_next, color: Colors.white),
 //                 onPressed: () => _stepFrame(1),
 //               ),
 //               const SizedBox(width: 16),
@@ -401,26 +398,52 @@
 //     if (_error != null && _displayBytes != null) {
 //       return Padding(
 //         padding: const EdgeInsets.all(8),
-//         child: Text(_error!,
-//             style: const TextStyle(color: Colors.red, fontSize: 11)),
+//         child: Text(
+//           _error!,
+//           style: const TextStyle(color: Colors.red, fontSize: 11),
+//         ),
 //       );
 //     }
 
 //     final result = _result;
 //     if (result == null) {
 //       return const Center(
-//         child: Text('No inference result',
-//             style: TextStyle(color: Colors.white38)),
+//         child: Text(
+//           'No inference result',
+//           style: TextStyle(color: Colors.white38),
+//         ),
 //       );
 //     }
 
-//     final lane       = result.lane;
-//     final detections = result.detections;
+//     final lane = result.lane;
+//     final dets = result.detections;
 
 //     final byClass = <String, List<DetectionModel>>{};
-//     for (final d in detections) {
+//     for (final d in dets) {
 //       byClass.putIfAbsent(d.className, () => []).add(d);
 //     }
+
+//     final lines = <String>[
+//       'Frame size: ${result.frameWidth}×${result.frameHeight}',
+//       'Detections: ${dets.length}',
+//       ...byClass.entries.map((e) {
+//         final best = e.value
+//             .map((d) => d.confidence)
+//             .reduce((a, b) => a > b ? a : b);
+//         return '  ${e.key}: ${e.value.length}  '
+//             '(best ${(best * 100).toStringAsFixed(0)}%)';
+//       }),
+//       if (lane != null) ...[
+//         '',
+//         'Lane type:   ${lane.type.name}',
+//         'Width:       ${lane.laneWidth.toStringAsFixed(2)} m',
+//         'Curvature:   ${lane.curvature.toStringAsFixed(4)} m⁻¹',
+//         'Drift:       ${lane.driftScore.toStringAsFixed(3)} m',
+//         'Confidence:  ${(lane.confidence * 100).toStringAsFixed(0)}%',
+//         'Center pts:  ${lane.centerLine.length}',
+//       ] else
+//         'Lane: not detected',
+//     ];
 
 //     return SingleChildScrollView(
 //       padding: const EdgeInsets.all(8),
@@ -432,27 +455,7 @@
 //         ),
 //         child: Column(
 //           crossAxisAlignment: CrossAxisAlignment.start,
-//           children: [
-//             Text('Frame size: ${result.frameWidth}×${result.frameHeight}'),
-//             Text('Detections: ${detections.length}'),
-//             ...byClass.entries.map((e) {
-//               final best = e.value
-//                   .map((d) => d.confidence)
-//                   .reduce((a, b) => a > b ? a : b);
-//               return Text(
-//                   '  ${e.key}: ${e.value.length}  (best ${(best * 100).toStringAsFixed(0)}%)');
-//             }),
-//             const SizedBox(height: 6),
-//             if (lane != null) ...[
-//               Text('Lane type:   ${lane.type.name}'),
-//               Text('Width:       ${lane.laneWidth.toStringAsFixed(2)} m'),
-//               Text('Curvature:   ${lane.curvature.toStringAsFixed(4)} m⁻¹'),
-//               Text('Drift:       ${lane.driftScore.toStringAsFixed(3)} m'),
-//               Text('Confidence:  ${(lane.confidence * 100).toStringAsFixed(0)}%'),
-//               Text('Center pts:  ${lane.centerLine.length}'),
-//             ] else
-//               const Text('Lane: not detected'),
-//           ],
+//           children: lines.map((s) => Text(s)).toList(),
 //         ),
 //       ),
 //     );

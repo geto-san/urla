@@ -78,16 +78,23 @@ class AppServices {
 
 class AppStarter {
   // Exposed for ImageTestScreen access without re-initializing.
+  static Future<AppServices>? _servicesFuture;
   static AppServices? _services;
-  static AppServices get services {
-    assert(_services != null, 'Call initServices() first');
-    return _services!;
+
+  // Phase 1: everything except camera – idempotent and concurrency-safe.
+  static Future<AppServices> initServices(AppDatabase db) {
+    if (_services != null) {
+      return Future.value(_services!);
+    }
+    if (_servicesFuture != null) {
+      return _servicesFuture!;
+    }
+
+    _servicesFuture = _loadServices(db);
+    return _servicesFuture!;
   }
 
-  // ── Phase 1: everything except camera ────────────────────────────────────
-  static Future<AppServices> initServices(AppDatabase db) async {
-    if (_services != null) return _services!;
-
+  static Future<AppServices> _loadServices(AppDatabase db) async {
     final sessionId = const Uuid().v4();
 
     // Calibration (tune focal lengths for your device)

@@ -3,7 +3,6 @@ import 'package:urla/data/database/app_database.dart';
 import 'package:urla/features/camera/viewmodel/camera_viewmodel.dart';
 import 'package:urla/features/dashboard/dashboard_screen.dart';
 import 'package:urla/features/image_test/image_test_screen.dart';
-import 'package:urla/features/image_test/simple_test_screen.dart';
 import 'package:urla/features/video_test/video_test_screen.dart';
 import 'package:urla/main.dart' show AppStarter, AppServices;
 
@@ -92,18 +91,18 @@ class _HomeScreenState extends State<HomeScreen> {
               label: const Text('Test with Image'),
               style: ElevatedButton.styleFrom(minimumSize: const Size(250, 50)),
               onPressed: () async {
-
                 print('[HomeScreen] Test with Image button pressed');
-                final services = await _servicesFuture;
-                print('[HomeScreen] Services ready');  
+                final services = await _servicesFuture;        // <-- ADD THIS
                 if (!mounted) return;
+
+                print('[HomeScreen] Services ready');
 
                 // Stop live camera if running so TFLite interpreter is free.
                 if (_liveViewModel != null) {
                   await _liveViewModel!.stop();
                 }
 
-                 print('[HomeScreen] Navigating to ImageTestScreen');
+                print('[HomeScreen] Navigating to ImageTestScreen');
                 Navigator.of(context).push(
                   MaterialPageRoute(
                     builder: (_) => ImageTestScreen(
